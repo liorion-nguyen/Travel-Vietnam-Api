@@ -1,0 +1,123 @@
+name: Docker
+
+on:
+  push:
+    branches: ["master"] # Khi có đẩy lên nhánh master
+    tags: ["v*.*.*"] # Khi có nhãn theo định dạng semver
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: duynguyenhnue/${{ github.event.repository.name }}
+  JWT_SECRET: ${{ secrets.JWT_SECRET }}
+  JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
+  DATABASE_MONGO_SRC: ${{ secrets.DATABASE_MONGO_SRC }}
+  PORT: 8000 # Cổng mặc định của server, có thể điều chỉnh nếu cần
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        with:
+          cosign-release: "v2.2.4"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      - name: Log into Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign the published Docker image
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          TAGS: ${{ steps.build-and-push.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+      - name: Deploy to server
+        env:
+          PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_REFRESH_SECRET: ${{ secrets.JWT_REFRESH_SECRET }}
+          DATABASE_MONGO_SRC: ${{ secrets.DATABASE_MONGO_SRC }}
+          PORT: 8000 # Cổng mặc định của server, có thể điều chỉnh nếu cần
+
+        run: |
+          # Tạo file private key tạm thời
+          echo "${PRIVATE_KEY}" > private_key.pem
+          chmod 600 private_key.pem
+
+          # Kết nối tới server và triển khai Docker container
+          ssh -o StrictHostKeyChecking=no -i private_key.pem $SERVER_USER@$SERVER_IP << 'EOF'
+
+          export JWT_SECRET="${JWT_SECRET}"
+          export JWT_REFRESH_SECRET="${JWT_REFRESH_SECRET}"
+          export DATABASE_MONGO_SRC="${DATABASE_MONGO_SRC}"
+
+          # Pull image từ Docker Hub
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          # Stop and remove the old container if it exists
+          docker stop travel_backend_container || true
+          docker rm travel_backend_container || true
+
+          # Chạy container mới, bind port 8000
+          docker run -d --restart unless-stopped \
+            -p 8080:8080 \
+            -e JWT_SECRET="travel-vietnam" \
+            -e JWT_REFRESH_SECRET="travel-vietnam-refresh" \
+            -e DATABASE_MONGO_SRC="mongodb+srv://stu715105064:ZeClf5THTVJyp5Jr@cluster0.yyq3k.mongodb.net/travel-social" \
+            -e WEBSOCKET_URL="https://socket.travel-vietnamese.me" \
+            -e PORT=8080 \
+            -e ACCOUNT_MAIL="stu715105031@hnue.edu.vn" \
+            -e PASSWORD_MAIL=Chugg203 \
+            -e VNPAY_TMN_CODE=V65MNMN3 \
+            -e DOMAIN_ADMIN=https://admin.travel-vietnamese.me \
+            -e DOMAIN_CLIENT=https://travel-vietnamese.me \
+            -e VNPAY_HASH_SECRET=32CFKSOQ7R4EISE9944JRCAHPDCXXA7J \
+            -e VNPAY_URL=https://sandbox.vnpayment.vn/paymentv2/vpcpay.html \
+            -e VNPAY_RETURN_URL=https://travel-vietnamese.me/vnpay/vnpay_return \
+            -e FIREBASE_TYPE=service_account \
+            -e FIREBASE_PROJECT_ID=travel-vietnam-2cca2 \
+            -e FIREBASE_PRIVATE_KEY_ID=efa22646da1b2b1de6259c88fca7868f0baf2ed9 \
+            -e FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC2H/zGnswGrAe+\nA7szoe610nEYI2+kumzCIJAtAGgoFxQKTbxJrjocMuITlnw43Tz0zLkA6VdIDO+T\ni7PWHyh6qR2CQNZ4YjEfS5GmaVP8SvUfhFz1Ema/ubKQoUgYV4KmzuyWJ/MEJL05\n3qfnA7fY4vWMhJ7NBO1Y7nJ8BjinupgnCl5Qdl52Tu/T1lE8ZAM6AzYbuFF/j01W\nrC9Kf8iXWoh9bMbDLBEf3VPxUZZoIVmcs+oPeQwUpwICnqK1yqVSYXDIxNsGG3/k\naODJy+cNCaPB+euNGWfDOpjCn9s7g60blZSy28ePFg163ZTFmBe+uQYX1z/niSYe\nRmv2jlkFAgMBAAECgf8Z8mZ7kE7IFlautHXTpVO5aRAXSvUkCfmC56C/Ola47a07\ndTtItcm8SPVQHDXBHRlD45F37DhRWb9WW1DnReywN67nPCrgQuQgQw6SdQuJNF2N\nJw5sowC5XiYZn4tXs5HGB23YEyATU333VgFrGfjzydOx4xagSYxOJlU3ZHKfq3hA\nLCHqkcmpCzaq84hl1Nz87AJO5EmANLeRlSCRfGEpaR+1yxog0J9FywF3BEfSk03C\nB3EjWTS7k4hrYyXnBTln6UCxcsXUp6d8fjw6hjGZY9Si8iovlFxBBe6gqLroIxya\nu8fCjpMb3ORAla8542FlBm1GJXt1Ewv0y5LeQfECgYEA4gTCm2azH6bRKZM8qgSB\nFicLcBmIFdpp2cYq8aJTAMRBSbhiYOQGQw9YYdde6cEdivMIc/LrJz+LnTwtVyaw\nMiGTjDsnjyI0yTnXXPvrVCMlG7h7+tPzJKUAlGCUKRBwBnYWk7wyF4sS9OPxj6Wt\n/S3ioB2W8xy7qsECfDOCGJUCgYEAzkiq2RpCGxO+nGhjNmnG97MvKsEtzzbXGkn3\nYmxN5vWFmGO+s6G6kTQD3oxvS1GnFpuipkQ9fVEUEfDsC1Q1cSxYL3iC0v+CmmEB\nC1BxZi29o7uC2DTNa3nm0mL3DYnKZ+yT5SC/58jJ9ziGsBRKc9P8gFgaoErkdeKR\nIYDFcrECgYEAud18Q9tS1maSfwQL0SzfEt6M82Srmn0Aqwvh6M+6Plkl73/ntxIN\nbDxETEGWVdhveQKfIurTInWJVIZWKuMv5inicmF7CKPykMA2MMsiHRDBxWgS3JRL\n0Qi3z00UyigwV7/olRkggGfn8Oc6kQyIZjnDsjRjHA227pbGemjJRXkCgYEAgLLl\npL21MJ+I9JxMCc7EzBWG/+22XumgGk67gTSBBe94gjL476mfdKg3IcoMRbmTvY8s\nUv+QPXcwRmFBY3AOR6Wa/0L4nBu9qAONWzm9BjrTbiu23p1S7BMJ54jHCjNFjMEV\nJIbiNAIZv5wMrB58tPc1Of293vPaxZGtanGkvoECgYEArEQyxQcsGI4npsIE2FE/\nia+5XNtErIziusgsdvju/26sXGOEH9GChudxmWxnHLgTURh9K85e45xvnI/UVCII\nhVQwvkd41OWhOwcN5qTRtFe+JIrGpuyWRwbVEAmtES2t4th+O7H/vr9w1IlcNb7A\nW9iC763FTJAjoSdIj5ZKgnk=\n-----END PRIVATE KEY-----\n" \
+            -e FIREBASE_CLIENT_EMAIL=firebase-adminsdk-s83o2@travel-vietnam-2cca2.iam.gserviceaccount.com \
+            -e FIREBASE_CLIENT_ID=117297000230148706048 \
+            -e FIREBASE_AUTH_URI=https://accounts.google.com/o/oauth2/auth \
+            -e FIREBASE_TOKEN_URI=https://oauth2.googleapis.com/token \
+            -e FIREBASE_AUTH_PROVIDER_X509_CERT_URL=https://www.googleapis.com/oauth2/v1/certs \
+            -e FIREBASE_CLIENT_X509_CERT_URL=https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-s83o2%40travel-vietnam-2cca2.iam.gserviceaccount.com \
+            -e FIREBASE_UNIVERSE_DOMAIN=googleapis.com \
+            --name travel_backend_container duynguyenhnue/travel-vietnam-api:latest
+          EOF
+
+          # Xóa file private key sau khi hoàn thành
+          rm private_key.pem
